@@ -7,6 +7,8 @@ import json
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless backend for Streamlit/servers
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
