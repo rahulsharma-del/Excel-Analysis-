@@ -5,21 +5,27 @@ import io
 import os
 import json
 
-import numpy as np
-import pandas as pd
+# --- headless plotting backend (important for servers/Streamlit Cloud) ---
 import matplotlib
-matplotlib.use("Agg")  # headless backend for Streamlit/servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+import numpy as np
+import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 import streamlit as st
 
 # =========================================================
-# Helper/analytics module "A" built from your latest code (fixed)
+# Helper/analytics module "A"
 # =========================================================
 class A:
     # ---------- parsing / time parts ----------
     @staticmethod
-    def _parse_dt(series: pd.Series, tz: Optional[str]) -> pd.Series:
+    def _parse_dt(series: pd.Series | None, tz: Optional[str]) -> pd.Series:
+        if series is None:
+            # Return an all-NaT series with UTC dtype to keep ops consistent
+            return pd.Series(pd.NaT, dtype="datetime64[ns, UTC]")
         s = pd.to_datetime(series, errors="coerce", utc=True)
         if tz:
             try:
@@ -45,7 +51,7 @@ class A:
 
     @staticmethod
     def derive_session_end(df: pd.DataFrame, session_timeout_min: Optional[int]) -> pd.Series:
-        # FIX: check for parsed column and build a Series regardless
+        # use parsed logout if present, else empty UTC series
         if "logout_date_parsed" in df.columns:
             logout = df["logout_date_parsed"].copy()
         else:
@@ -70,7 +76,7 @@ class A:
             df["logon_date_parsed"] = A._parse_dt(df["Date"], tz)
 
         dt = df["logon_date_parsed"]
-        df["date"] = pd.to_datetime(dt.dt.date)  # naive midday timestamps for grouping
+        df["date"] = pd.to_datetime(dt.dt.date)  # naive date stamps for grouping
         df["hour"] = dt.dt.hour
         df["dow"] = dt.dt.dayofweek
         df["month"] = dt.dt.to_period("M").dt.to_timestamp()
@@ -116,16 +122,15 @@ class A:
 
     @staticmethod
     def session_duration_stats(df: pd.DataFrame) -> pd.DataFrame:
-        def _quantiles(series: pd.Series, qs=(0.5, 0.9, 0.99)) -> dict:
-            q = series.dropna().quantile(qs)
-            return {f"p{int(p*100)}": q.loc[p] for p in qs}
-
         s = df["session_minutes"]
+        q = s.dropna().quantile([0.5, 0.9, 0.99])
         stats = {
             "count_non_null": int(s.notna().sum()),
             "count_null": int(s.isna().sum()),
             "mean_minutes": float(np.nanmean(s)),
-            **_quantiles(s, (0.5, 0.9, 0.99)),
+            "p50": float(q.get(0.5, np.nan)) if not q.empty else np.nan,
+            "p90": float(q.get(0.9, np.nan)) if not q.empty else np.nan,
+            "p99": float(q.get(0.99, np.nan)) if not q.empty else np.nan,
         }
         return pd.DataFrame([stats])
 
@@ -250,9 +255,12 @@ class A:
         concur = events.cumsum()
 
         daily_peak = concur.resample("D").max().fillna(0).astype(int)
+        # make index tz-naive for plotting/CSV
+        if getattr(daily_peak.index, "tz", None) is not None:
+            daily_peak.index = daily_peak.index.tz_convert(None)
+
         daily_peak = daily_peak.rename("peak_concurrency")
-        daily_peak.index.name = "date"
-        return daily_peak.reset_index()
+        return daily_peak.reset_index(names="date")
 
     # ---------- plotting (PNG bytes for downloads) ----------
     @staticmethod
@@ -263,24 +271,34 @@ class A:
         return buf.getvalue()
 
     @staticmethod
-    def make_time_series_fig(df: pd.DataFrame, x: str, y: str, title: str) -> Tuple[plt.Figure, bytes]:
+    def make_time_series_fig(df: pd.DataFrame, x: str, y: str, title: str) -> Tuple[plt.Figure | None, bytes]:
         if df.empty or x not in df.columns or y not in df.columns:
             return None, b""
         fig = plt.figure(figsize=(8, 3.5))
         ax = fig.gca()
-        ax.plot(df[x], df[y])
-        ax.set_title(title)
-        ax.set_xlabel(x)
-        ax.set_ylabel(y)
-        if np.issubdtype(df[x].dtype, np.datetime64):
+        # Robust to tz-aware datetimes
+        if is_datetime64_any_dtype(df[x]):
+            xvals = pd.to_datetime(df[x], errors="coerce")
+            try:
+                # if tz-aware, drop tz for plotting
+                if getattr(xvals.dt, "tz", None) is not None:
+                    xvals = xvals.dt.tz_convert(None)
+            except Exception:
+                pass
+            ax.plot(xvals, df[y])
             locator = mdates.AutoDateLocator()
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        else:
+            ax.plot(df[x], df[y])
+        ax.set_title(title)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
         fig.tight_layout()
         return fig, A._fig_to_png_bytes(fig)
 
     @staticmethod
-    def make_hist_fig(series: pd.Series, title: str, xlabel: str, bins: int = 60) -> Tuple[plt.Figure, bytes]:
+    def make_hist_fig(series: pd.Series, title: str, xlabel: str, bins: int = 60) -> Tuple[plt.Figure | None, bytes]:
         s = pd.to_numeric(series, errors="coerce").dropna()
         if s.empty:
             return None, b""
@@ -296,7 +314,7 @@ class A:
         return fig, A._fig_to_png_bytes(fig)
 
     @staticmethod
-    def make_heatmap_hour_dow_fig(df: pd.DataFrame) -> Tuple[plt.Figure, bytes]:
+    def make_heatmap_hour_dow_fig(df: pd.DataFrame) -> Tuple[plt.Figure | None, bytes]:
         scope = df.dropna(subset=["hour", "dow"])
         if scope.empty:
             return None, b""
@@ -316,10 +334,10 @@ class A:
         return fig, A._fig_to_png_bytes(fig)
 
     @staticmethod
-    def make_retention_heatmap_fig(ret_tbl: pd.DataFrame) -> Tuple[plt.Figure, bytes]:
+    def make_retention_heatmap_fig(ret_tbl: pd.DataFrame) -> Tuple[plt.Figure | None, bytes]:
         if ret_tbl.empty or ret_tbl.shape[1] <= 1:
             return None, b""
-        m = ret_tbl.drop(columns=[], errors="ignore").copy()
+        m = ret_tbl.copy()
         fig = plt.figure(figsize=(8, 3.5))
         ax = fig.gca()
         im = ax.imshow(m.values, aspect="auto", vmin=0, vmax=1)
@@ -530,6 +548,10 @@ def run_analytics(df: pd.DataFrame, tz: str, session_timeout: int, lookback_days
     df = A.compute_session_minutes(df, session_timeout_min=timeout)
     df["logout_date_effective"] = A.derive_session_end(df, timeout)
 
+    # Optional: fill unknown groups so they appear in bar charts
+    for c in ["Industry", "browser", "operating_system", "org_name"]:
+        df[c] = df[c].fillna("Unknown")
+
     # Metrics
     daily = A.daily_metrics(df)
     weekly = A.weekly_metrics(df)
@@ -550,148 +572,4 @@ def run_analytics(df: pd.DataFrame, tz: str, session_timeout: int, lookback_days
         if fig: figs["sessions_daily"] = png; st.pyplot(fig)
         daily_plt = daily.copy()
         daily_plt["stickiness_smoothed"] = daily_plt["stickiness_dau_over_mau"].rolling(7, min_periods=1).mean()
-        fig, png = A.make_time_series_fig(daily_plt, "date", "stickiness_smoothed", "Stickiness (DAU/MAU, 7d avg)")
-        if fig: figs["stickiness_daily"] = png; st.pyplot(fig)
-
-    if df["session_minutes"].notna().any():
-        st.markdown("#### Session Duration")
-        fig, png = A.make_hist_fig(df["session_minutes"], "Session Duration (trimmed at 99th pct)", "minutes", bins=60)
-        if fig: figs["session_duration_hist"] = png; st.pyplot(fig)
-
-    if df["hour"].notna().any() and df["dow"].notna().any():
-        st.markdown("#### Hour x Day Heatmap")
-        fig, png = A.make_heatmap_hour_dow_fig(df)
-        if fig: figs["heatmap_hour_dow"] = png; st.pyplot(fig)
-
-    if not ret_tbl.empty:
-        st.markdown("#### Retention")
-        fig, png = A.make_retention_heatmap_fig(ret_tbl)
-        if fig: figs["retention_heatmap"] = png; st.pyplot(fig)
-
-    if not concurrency.empty:
-        st.markdown("#### Estimated Peak Concurrency")
-        fig, png = A.make_time_series_fig(concurrency, "date", "peak_concurrency", "Estimated Peak Concurrency (Daily)")
-        if fig: figs["concurrency_daily"] = png; st.pyplot(fig)
-
-    # Business rollups & quick bars
-    st.markdown("### Business Rollups (Lookback Window)")
-    biz = build_business_insights(df, lookback_days=lookback_days)
-    if not biz["by_industry"].empty:
-        st.markdown("**Top industries (unique users)**")
-        st.bar_chart(biz["by_industry"].set_index("Industry"))
-    if not biz["by_org_top10"].empty:
-        st.markdown("**Top orgs**")
-        st.bar_chart(biz["by_org_top10"].set_index("org_name"))
-    if not biz["by_browser"].empty:
-        st.markdown("**Browser share**")
-        st.bar_chart(biz["by_browser"].set_index("browser"))
-    if not biz["by_os"].empty:
-        st.markdown("**OS share**")
-        st.bar_chart(biz["by_os"].set_index("operating_system"))
-    if not biz["by_hour"].empty:
-        st.markdown("**Active users by hour**")
-        st.bar_chart(biz["by_hour"].sort_values("hour").set_index("hour"))
-
-    # Safe JSON for Gemini
-    daily2, weekly2, monthly2 = daily.copy(), weekly.copy(), monthly.copy()
-    if "date" in daily2.columns: daily2["date"] = daily2["date"].astype(str)
-    if "week" in weekly2.columns: weekly2["week"] = weekly2["week"].astype(str)
-    if "month" in monthly2.columns: monthly2["month"] = monthly2["month"].astype(str)
-    conc2 = concurrency.copy()
-    if not conc2.empty and "date" in conc2.columns:
-        conc2["date"] = conc2["date"].astype(str)
-    org2 = org_30d.copy()
-    if not org2.empty and "last_seen" in org2.columns:
-        org2["last_seen"] = org2["last_seen"].astype(str)
-
-    metrics_json = {
-        "window": {"lookback_days": lookback_days, "timezone": tz},
-        "daily_tail": daily2.tail(14).to_dict(orient="list") if not daily2.empty else {},
-        "weekly_tail": weekly2.tail(8).to_dict(orient="list") if not weekly2.empty else {},
-        "monthly": monthly2.to_dict(orient="list") if not monthly2.empty else {},
-        "duration_stats": duration_stats.to_dict(orient="records"),
-        "top_orgs_30d": org2.head(10).to_dict(orient="records") if not org2.empty else [],
-        "concurrency_tail": conc2.tail(14).to_dict(orient="list") if not conc2.empty else {},
-        "biz_rollups": {
-            "by_industry": biz["by_industry"].to_dict(orient="records"),
-            "by_org_top10": biz["by_org_top10"].to_dict(orient="records"),
-            "by_browser": biz["by_browser"].to_dict(orient="records"),
-            "by_os": biz["by_os"].to_dict(orient="records"),
-            "by_hour": biz["by_hour"].to_dict(orient="records"),
-            "window_start": biz["window_start"],
-            "window_end": biz["window_end"],
-        },
-    }
-
-    if include_sample_rows and not df.empty:
-        cols = [c for c in df.columns if c not in ["email_address", "first_name", "last_name", "Full Name"]]
-        sample = df[cols].head(50).copy()
-        for c in ["logon_date_parsed", "logout_date_parsed", "date", "month"]:
-            if c in sample.columns:
-                sample[c] = sample[c].astype(str)
-        metrics_json["sample_rows_head"] = sample.to_dict(orient="records")
-
-    dfs = {
-        "metrics_daily": daily, "metrics_weekly": weekly, "metrics_monthly": monthly,
-        "session_duration_stats": duration_stats, "org_activity_30d": org_30d,
-        "browser_os_share": bshare, "retention_table": ret_tbl, "concurrency_daily_peak": concurrency
-    }
-    return dfs, figs, metrics_json
-
-# ---------- run button ----------
-if run_btn:
-    df, err = _load_df(uploaded, sheet)
-    if err:
-        st.error(err)
-    else:
-        with st.spinner("Crunching numbers (in memory)..."):
-            dfs, figs, metrics_json = run_analytics(
-                df, tz=tz, session_timeout=session_timeout, lookback_days=lookback_days, include_sample_rows=include_sample_rows
-            )
-            st.session_state["results"] = {"dfs": dfs, "figs": figs, "metrics_json": metrics_json}
-
-# ---------- UI tabs ----------
-res = st.session_state["results"]
-tabs = st.tabs(["Tables", "Downloads", "Gemini Chat", "Insights & Action Plan"])
-
-with tabs[0]:
-    st.subheader("Data Tables")
-    if not res:
-        st.info("Upload a file and click **Run Analysis** to begin.")
-    else:
-        for name, d in res["dfs"].items():
-            st.markdown(f"**{name}**")
-            st.dataframe(d)
-
-with tabs[1]:
-    st.subheader("Download your results (in memory)")
-    if not res:
-        st.info("Run analysis first.")
-    else:
-        csv_bytes = _dfs_to_csv_bytes(res["dfs"])
-        fig_bytes = _fig_bytes_zip(res["figs"])
-        for fname, b in csv_bytes.items():
-            st.download_button(f"Download {fname}", b, file_name=fname, mime="text/csv")
-        for fname, b in fig_bytes.items():
-            st.download_button(f"Download {fname}", b, file_name=fname, mime="image/png")
-
-with tabs[2]:
-    st.subheader("Chat with Gemini")
-    ask = st.button("Ask", use_container_width=False)
-    if ask and user_prompt and res:
-        st.info("Querying Gemini...")
-        reply = _gemini_generate(user_prompt, res["metrics_json"], gemini_api_key, gemini_model, max_tokens)
-        st.markdown("**Gemini says:**")
-        st.write(reply)
-    elif not res:
-        st.info("Run analysis first.")
-
-with tabs[3]:
-    st.subheader("Auto Insights & 2-Week Action Plan")
-    if not res:
-        st.info("Run analysis first.")
-    else:
-        if st.button("🧠 Generate executive summary & plan", type="primary", use_container_width=True):
-            with st.spinner("Asking Gemini for an executive summary and action plan..."):
-                text = gemini_summary_and_plan(res["metrics_json"], gemini_api_key, gemini_model, max_tokens)
-                st.markdown(text)
+        fig, png = A
