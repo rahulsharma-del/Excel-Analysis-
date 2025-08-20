@@ -2,5 +2,5 @@ streamlit
 pandas
 numpy
 matplotlib
+openpyxl         # for Excel uploads (.xlsx, .xls)
 google-generativeai
-openpyxl     # needed if you upload Excel files
