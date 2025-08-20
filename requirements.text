@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+matplotlib
+google-generativeai
+openpyxl     # needed if you upload Excel files
